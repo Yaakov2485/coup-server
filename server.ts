@@ -16,7 +16,7 @@ import {
   resolveBlockChallenge
 } from "./gameLogic";
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const wss = new WebSocketServer({ port: PORT });
 console.log(`Coup server running on port ${PORT}`);
 

@@ -15,17 +15,22 @@ import {
   CharacterCard,
   resolveBlockChallenge
 } from "./gameLogic";
+import { randomBytes } from "crypto";
 
+function makeToken(): string {
+  return randomBytes(16).toString("hex"); // 32-char random string
+}
 const PORT = Number(process.env.PORT) || 3000;
 const wss = new WebSocketServer({ port: PORT });
 console.log(`Coup server running on port ${PORT}`);
 
 // ===== LOBBY + GAME STATE =====
-
 type Seat = {
   socket: WebSocket;
   name: string;
-  id: number;        // seat index / player id
+  id: number;
+  token: string;        // ⬅️ NEW: the reconnection secret
+  connected: boolean;   // ⬅️ NEW: is their socket currently alive?
 };
 let pendingBlockChallenge: { responders: number[] } | null = null;
 let seats: Seat[] = [];
@@ -121,12 +126,21 @@ wss.on("connection", (socket) => {
       
       // --- JOIN: claim a seat with a name ---
       if (msg.type === "join") {
-        // ignore joins once the game has started
         if (game) return;
-        const seat: Seat = { socket, name: msg.name || `Player ${nextId + 1}`, id: nextId };
+        const seat: Seat = {
+          socket,
+          name: msg.name || `Player ${nextId + 1}`,
+          id: nextId,
+          token: makeToken(),      // ⬅️ NEW
+          connected: true,         // ⬅️ NEW
+        };
         nextId++;
         seats.push(seat);
         console.log(`${seat.name} joined as seat ${seat.id}.`);
+
+        // send the player their token (they must save it)
+        socket.send(JSON.stringify({ type: "token", token: seat.token }));  // ⬅️ NEW
+
         broadcastLobby();
       }
       else if (msg.type === "exchange") {
@@ -138,6 +152,28 @@ wss.on("connection", (socket) => {
         setupResponseWindows();
         normalizePhase();
         broadcastViews();
+      }
+      else if (msg.type === "reconnect") {
+        // find the seat holding this token
+        const seat = seats.find((s) => s.token === msg.token);
+
+        if (!seat) {
+          // token unknown (server restarted, or bogus) → tell them to join fresh
+          socket.send(JSON.stringify({ type: "reconnectFailed" }));
+          return;
+        }
+
+        // swap the dead socket for the new one
+        seat.socket = socket;
+        seat.connected = true;
+        console.log(`${seat.name} reconnected.`);
+
+        // put them right back where they were
+        if (game) {
+          socket.send(JSON.stringify({ type: "view", view: viewFor(game, seat.id) }));
+        } else {
+          broadcastLobby();
+        }
       }
       else if (msg.type === "restart") {
         const seat = seats.find((s) => s.socket === socket);
@@ -285,12 +321,15 @@ else if (msg.type === "action") {
   
   socket.on("close", () => {
     const seat = seats.find((s) => s.socket === socket);
-    if (seat) console.log(`${seat.name} disconnected.`);
-    // For now, remove from lobby if game hasn't started.
+    if (seat) {
+      seat.connected = false;    // ⬅️ NEW: mark them away
+      console.log(`${seat.name} disconnected.`);
+    }
     if (!game) {
+      // lobby: remove them entirely (as before)
       seats = seats.filter((s) => s.socket !== socket);
       broadcastLobby();
     }
-    // (Mid-game disconnects we'll handle properly later.)
+    // in-game: seat stays, marked disconnected, awaiting reconnect
   });
 });
